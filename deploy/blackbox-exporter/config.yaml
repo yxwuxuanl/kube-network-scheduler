@@ -1,0 +1,6 @@
+modules:
+  http_2xx:
+    http:
+      follow_redirects: true
+    prober: http
+    timeout: 5s

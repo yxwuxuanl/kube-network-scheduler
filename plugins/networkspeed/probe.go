@@ -7,46 +7,51 @@ import (
 	"fmt"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/klog/v2"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
 
-func (n *NetworkSpeed) getProber(nodeName string) *v1.Pod {
+const (
+	ProbeTargetAnnotation = "network-scheduler/probe-target"
+	ProbeModuleAnnotation = "network-scheduler/probe-module"
+	DefaultProbeModule    = "http_2xx"
+	ProbeDurationMetric   = "probe_duration_seconds"
+)
+
+func (n *NetworkSpeedPlugin) getProber(nodeName string) (*v1.Pod, error) {
 	pods, err := n.handle.
 		SharedInformerFactory().
 		Core().
 		V1().
 		Pods().
 		Lister().
-		List(labels.SelectorFromSet(n.config.Prober.Selector))
+		List(labels.SelectorFromSet(n.config.Selector))
 
 	if err != nil {
-		klog.ErrorS(err, "list prober error")
-		return nil
+		return nil, err
 	}
 
 	for _, pod := range pods {
-		if pod.Namespace == n.config.Prober.Namespace &&
-			pod.Spec.NodeName == nodeName &&
+		if pod.Spec.NodeName == nodeName &&
+			pod.Namespace == n.config.Namespace &&
 			pod.Status.Phase == v1.PodRunning {
-			return pod
+			return pod, nil
 		}
 	}
 
-	return nil
+	return nil, errors.New("no available prober")
 }
 
-func (n *NetworkSpeed) doProbe(ctx context.Context, proberAddr string) (duration float64, err error) {
-	proberConf := n.config.Prober
+func (n *NetworkSpeedPlugin) doProbe(ctx context.Context, nodename, target, module string) (duration time.Duration, err error) {
+	prober, err := n.getProber(nodename)
+	if err != nil {
+		return 0, fmt.Errorf("getProber error: %w", err)
+	}
+
 	probeUrl := fmt.Sprintf(
 		"http://%s:%d/probe?module=%s&target=%s",
-		proberAddr,
-		proberConf.Port,
-		proberConf.Module,
-		proberConf.Target,
+		prober.Status.PodIP, n.config.Port, module, target,
 	)
 
 	r, err := http.NewRequest(http.MethodGet, probeUrl, nil)
@@ -54,10 +59,13 @@ func (n *NetworkSpeed) doProbe(ctx context.Context, proberAddr string) (duration
 		return 0, err
 	}
 
-	timeout, cancel := context.WithTimeout(ctx, time.Microsecond*time.Duration(proberConf.Timeout))
+	timeoutCtx, cancel := context.WithTimeout(
+		ctx,
+		time.Millisecond*time.Duration(n.config.Timeout),
+	)
 	defer cancel()
 
-	res, err := http.DefaultClient.Do(r.WithContext(timeout))
+	res, err := http.DefaultClient.Do(r.WithContext(timeoutCtx))
 	if err != nil {
 		return 0, err
 	}
@@ -66,18 +74,30 @@ func (n *NetworkSpeed) doProbe(ctx context.Context, proberAddr string) (duration
 		return 0, errors.New("bad status: " + res.Status)
 	}
 
-	rl := bufio.NewScanner(res.Body)
 	defer res.Body.Close()
+	scanner := bufio.NewScanner(res.Body)
 
-	for rl.Scan() {
-		if line := rl.Text(); strings.HasPrefix(line, "probe_duration_seconds") {
+	for scanner.Scan() {
+		if line := scanner.Text(); strings.HasPrefix(line, ProbeDurationMetric) {
 			items := strings.Fields(line)
 			if len(items) >= 2 {
-				return strconv.ParseFloat(items[1], 64)
+				return time.ParseDuration(items[1] + "s")
 			}
 			break
 		}
 	}
 
-	return 0, err
+	return 0, fmt.Errorf("can't get %s metric", ProbeDurationMetric)
+}
+
+func getProbeConfig(pod *v1.Pod) (target, module string, ok bool) {
+	if target = pod.Annotations[ProbeTargetAnnotation]; target == "" {
+		return "", "", false
+	}
+
+	if module = pod.Annotations[ProbeModuleAnnotation]; module == "" {
+		module = DefaultProbeModule
+	}
+
+	return target, module, true
 }

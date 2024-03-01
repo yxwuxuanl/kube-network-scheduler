@@ -2,87 +2,90 @@ package networkspeed
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	"math"
-	"sync/atomic"
+	"os"
+	"slices"
 )
 
 const PluginName = "NetworkSpeed"
 
 type Config struct {
-	Prober struct {
-		Selector  map[string]string `json:"selector"`
-		Namespace string            `json:"namespace"`
-		Port      int               `json:"port"`
-		Module    string            `json:"module"`
-		Target    string            `json:"target"`
-		Timeout   int64             `json:"timeout"`
-	} `json:"prober"`
-	MaxPods int32 `json:"maxPods"`
+	Selector  map[string]string `json:"selector"`
+	Namespace string            `json:"namespace"`
+	Timeout   int64             `json:"timeout"`
+	Port      int               `json:"port"`
 }
 
-type NetworkSpeed struct {
-	config        *Config
-	remainingPods *int32
-	handle        framework.Handle
+type NetworkSpeedPlugin struct {
+	config *Config
+	handle framework.Handle
 }
 
-func (n *NetworkSpeed) Name() string {
+func (n *NetworkSpeedPlugin) Name() string {
 	return PluginName
 }
 
-func (n *NetworkSpeed) PreEnqueue(ctx context.Context, p *v1.Pod) *framework.Status {
-	if atomic.LoadInt32(n.remainingPods) < 0 {
+func (n *NetworkSpeedPlugin) Score(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) (int64, *framework.Status) {
+	target, module, ok := getProbeConfig(p)
+	if !ok {
+		return 0, nil
+	}
+
+	duration, err := n.doProbe(ctx, nodeName, target, module)
+	if err != nil {
+		klog.Error("doProbe error", "err", err.Error())
+		return 0, nil
+	}
+
+	klog.InfoS(
+		"doProbe",
+		"node", nodeName,
+		"target", target,
+		"pod", p.Namespace+"/"+p.Name,
+		"duration", duration,
+	)
+
+	return duration.Microseconds(), nil
+}
+
+func (n *NetworkSpeedPlugin) Filter(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+	if _, err := n.getProber(nodeInfo.Node().Name); err != nil {
+		klog.ErrorS(
+			err, "Filter error",
+			"node", nodeInfo.Node().Name,
+			"pod", pod.Namespace+"/"+pod.Name,
+		)
 		return framework.NewStatus(framework.Unschedulable)
 	}
 
 	return nil
 }
 
-func (n *NetworkSpeed) Filter(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
-	if n.getProber(nodeInfo.Node().Name) != nil {
-		return framework.NewStatus(framework.Success)
+func (n *NetworkSpeedPlugin) NormalizeScore(ctx context.Context, state *framework.CycleState, p *v1.Pod, scores framework.NodeScoreList) *framework.Status {
+	slices.SortFunc(scores, func(a, b framework.NodeScore) int {
+		return int(a.Score - b.Score)
+	})
+
+	for i, score := range scores {
+		if score.Score == 0 {
+			continue
+		}
+		scores[i].Score = int64((len(scores) - i) * (100 / len(scores)))
 	}
 
-	return framework.NewStatus(framework.Unschedulable, "no available prober pod")
-}
+	klog.InfoS("NormalizeScore", "scores", scores)
 
-func (n *NetworkSpeed) Score(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) (int64, *framework.Status) {
-	prober := n.getProber(nodeName)
-	if prober == nil {
-		return 0, nil
-	}
-
-	duration, err := n.doProbe(ctx, prober.Status.PodIP)
-	if err != nil {
-		klog.ErrorS(err, "doProbe error")
-		return 0, nil
-	}
-
-	var score int64
-
-	if duration > 0 {
-		score = int64(math.Ceil(1-duration) * 100)
-	}
-
-	klog.InfoS(
-		"doProbe",
-		"nodeName", nodeName, "duration", duration, "score", score,
-	)
-
-	return score, nil
-}
-
-func (n *NetworkSpeed) ScoreExtensions() framework.ScoreExtensions {
 	return nil
 }
 
-func (n *NetworkSpeed) PostBind(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) {
-	atomic.AddInt32(n.remainingPods, -1)
+func (n *NetworkSpeedPlugin) ScoreExtensions() framework.ScoreExtensions {
+	return n
 }
 
 func New(ctx context.Context, configuration runtime.Object, handle framework.Handle) (framework.Plugin, error) {
@@ -91,15 +94,31 @@ func New(ctx context.Context, configuration runtime.Object, handle framework.Han
 		return nil, err
 	}
 
-	if config.Prober.Timeout == 0 {
-		config.Prober.Timeout = 500
+	if config.Selector == nil {
+		return nil, errors.New("prober selector is nil")
 	}
 
-	remainingPods := config.MaxPods
+	if config.Timeout == 0 {
+		config.Timeout = 3000
+	}
 
-	return &NetworkSpeed{
-		config:        &config,
-		remainingPods: &remainingPods,
-		handle:        handle,
+	if config.Namespace == "" {
+		data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+		if err != nil {
+			return nil, fmt.Errorf("get namesapce error: %w", err)
+		}
+
+		config.Namespace = string(data)
+	}
+
+	if config.Port == 0 {
+		config.Port = 9115
+	}
+
+	klog.InfoS("scheduler config", "config", config)
+
+	return &NetworkSpeedPlugin{
+		config: &config,
+		handle: handle,
 	}, nil
 }

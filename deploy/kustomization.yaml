@@ -1,0 +1,23 @@
+namespace: network-scheduler
+
+resources:
+  - blackbox-exporter/daemonset.yaml
+  - scheduler/rbac.yaml
+  - scheduler/scheduler.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/instance: network-scheduler
+    includeTemplates: true
+
+configMapGenerator:
+  - files:
+      - blackbox-exporter/config.yaml
+    name: blackbox-exporter-config
+    options: &options
+      disableNameSuffixHash: true
+  - files:
+      - scheduler/config.yaml
+    name: network-scheduler-config
+    options:
+      <<: *options

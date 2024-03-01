@@ -1,0 +1,16 @@
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+leaderElection:
+  leaderElect: false
+profiles:
+  - schedulerName: network-scheduler
+    plugins:
+      multiPoint:
+        enabled:
+          - name: NetworkSpeed
+    pluginConfig:
+      - name: NetworkSpeed
+        args:
+          selector:
+            app.kubernetes.io/instance: network-scheduler
+            app.kubernetes.io/name: blackbox-exporter

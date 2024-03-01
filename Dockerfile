@@ -1,4 +1,4 @@
-FROM golang:1.21.5
+FROM golang:1.22.0
 
 WORKDIR /app
 
@@ -9,7 +9,6 @@ RUN go mod download -x
 COPY . .
 
 RUN GCO_ENABLED=0 go build -ldflags "-s -w" -o scheduler main.go
-
 
 FROM alpine:3.17
 

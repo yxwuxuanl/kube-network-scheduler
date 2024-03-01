@@ -1,6 +1,6 @@
 module k8s-network-scheduler
 
-go 1.21.5
+go 1.22.0
 
 replace k8s.io/api => k8s.io/api v0.29.0
 
